@@ -1,55 +1,200 @@
-# Prerequisites
-*.d
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <DHT.h>
 
-# Object files
-*.o
-*.ko
-*.obj
-*.elf
+// ==== Sensörlerin Giriş Pinleri ====
+#define YANGINPIN A7
+#define DHTPIN A4
+#define DHTTYPE DHT22
+#define ONE_WIRE_BUS A5
+// ==== Çıkış Pinleri ====
+#define BUZZER A0
+#define ROLE_ISITICI 2
+#define ROLE_FAN 3
 
-# Linker output
-*.ilk
-*.map
-*.exp
+DHT dht(DHTPIN, DHTTYPE);
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature ds18b20(&oneWire);
 
-# Precompiled Headers
-*.gch
-*.pch
+// ==== Ayarlar ====
+const float YANGIN_SENSOR_ESIGI = 425;  //gece 1020 değeri iyiydi gündüz 400 iyiydi ben 425 yaptım burayı. 400-500 arası ayarlanabilir. dolap çok güneşli bir tarafa doğru bakmasın. normal gün ışığı olan oda ışığına doğru baksın
+const float HEDEF_SICAKLIK = 23.0;
+const float HEDEF_NEM = 50.0;
+const float SICAKLIK_TOLERANS = 2.0; 
+const float HIZLI_ARTIS_ESIGI = 0.052;  //0.028 bende idealdi. Ama dolap kapağı açılınca içeri dolacak sıcak havadan etkilenip ötmesin diye azcık arttırdım.
+const float HIZLI_ARTIS_ESIGI__TOLERANSI = 0.03;  // 0.028 minimum
+const unsigned long KONTROL_ARALIGI = 3000;
 
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
+// ==== Değişkenler ====
+float dht_sicaklik = 0;
+float dht_nem = 0;
+float ds_sicaklik = 0;
+float ortalamaSicaklik = 0;
+float oncekiSicaklik = 0;
+unsigned long oncekiZaman = 0;
 
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
+bool alarmDurumu = false; // Yangın ya da hata varsa true
+bool sensorHatasi = false; // sensör devre dışı mı?
 
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
+// ==== Kurulum ====
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+  ds18b20.begin();
 
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
+  pinMode(BUZZER, OUTPUT);
+  pinMode(ROLE_ISITICI, OUTPUT);
+  pinMode(ROLE_FAN, OUTPUT);
 
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
+  roleleriKapat();
 
-# debug information files
-*.dwo
+  Serial.println(F("Sistem basladi..."));
+}
+
+// ==== Ana Döngü ====
+void loop() {
+  unsigned long simdi = millis();
+
+  // Eğer sensör hatası varsa uyarı sesi çıkar
+  if (sensorHatasi && !alarmDurumu) {
+    sensorHataAlarmi();
+  }
+
+  // Eğer yangın alarmı aktifse yüksek sesli alarm çal ve sistemi durdur
+  if (alarmDurumu) {KONTROL_ARALIGI
+    yanginAlarmi();
+    return;
+  }
+
+  if (simdi - oncekiZaman >= KONTROL_ARALIGI) {
+    oncekiZaman = simdi;
+
+    sensorVerileriniOku();
+    sicaklikArtisKontrol();
+    ortamKontrolu();
+    yanginSensoruVeriOku();
+  }
+}
+
+// ==== Yangın Sensörünü Okuyor ====
+void yanginSensoruVeriOku(){
+int yanginSensoru = analogRead(YANGINPIN);
+  Serial.println(F("YANGIN SENSORU DEGERI =>"));  Serial.print(yanginSensoru);
+  
+  if(yanginSensoru < YANGIN_SENSOR_ESIGI) {
+    yanginAlarmi();
+  }
+
+}
+
+// ==== Sensörleri Oku ====
+void sensorVerileriniOku() {
+  dht_nem = dht.readHumidity();
+  dht_sicaklik = dht.readTemperature();
+  ds18b20.requestTemperatures();
+  ds_sicaklik = ds18b20.getTempCByIndex(0);
+
+  // sensör hatası kontrolü
+  if (isnan(dht_sicaklik) || isnan(dht_nem) || ds_sicaklik < -50) {
+    Serial.println(F(" X X Sensör hatası! Röleler kapatıldı."));
+    sensorHatasi = true;
+    roleleriKapat();
+    return;
+  } else {
+    sensorHatasi = false; // false demek sensörler normal değeri döndürüyor demek
+  }
+
+  ortalamaSicaklik = (dht_sicaklik + ds_sicaklik) / 2.0;
+
+  Serial.print(F("DHT: ")); Serial.print(dht_sicaklik, 2);
+  Serial.print(F("°C | DS: ")); Serial.print(ds_sicaklik, 2);
+  Serial.print(F("°C | Ort: ")); Serial.print(ortalamaSicaklik, 2);
+  Serial.print(F("°C | Nem: ")); Serial.print(dht_nem, 1);
+  Serial.println(F("%"));
+}
+
+// ==== Sıcaklık Artış Kontrolü ====
+void sicaklikArtisKontrol() {
+  static unsigned long oncekiArtisZamani = 0;
+  unsigned long simdi = millis();
+
+  if (oncekiArtisZamani == 0) {
+    oncekiArtisZamani = simdi;
+    oncekiSicaklik = ortalamaSicaklik;
+    return;
+  }
+
+  float zamanFarki = (simdi - oncekiArtisZamani) / 1000.0;
+  float fark = ortalamaSicaklik - oncekiSicaklik;
+
+  if (fabs(fark) < HIZLI_ARTIS_ESIGI__TOLERANSI) fark = 0;
+
+  float artisHizi = fark / zamanFarki;
+
+  Serial.print(F("Artış hızı: "));
+  Serial.print(artisHizi, 3);
+  Serial.println(F(" °C/s"));
+
+  // Yangın kontrolü
+  if (artisHizi > HIZLI_ARTIS_ESIGI) {
+    Serial.println(F("DİKKAT !!! Sıcaklık çok hızlı artıyor! YANGIN ALARMI !!!"));
+    roleleriKapat();
+    alarmDurumu = true;
+  }
+
+  oncekiSicaklik = ortalamaSicaklik;
+  oncekiArtisZamani = simdi;
+}
+
+// ==== Ortam Kontrolü ====
+void ortamKontrolu() {
+  if (alarmDurumu) return; // Yangın varsa nem kontrolü devre dışı ( yüksek sıcaklık nemi düşürdüğü için kafa karışmasın diye)
+  if (sensorHatasi) return; // Sensör bozuksa röle çalışmaz
+
+  if (ortalamaSicaklik < HEDEF_SICAKLIK - SICAKLIK_TOLERANS) {
+    digitalWrite(ROLE_ISITICI, HIGH);
+    digitalWrite(ROLE_FAN, LOW);
+    Serial.println(F("→ Isıtıcı aktif (sıcaklık düşük)"));
+  }
+  else if (ortalamaSicaklik > HEDEF_SICAKLIK + SICAKLIK_TOLERANS) {
+    digitalWrite(ROLE_ISITICI, LOW);
+    digitalWrite(ROLE_FAN, HIGH);
+    Serial.println(F("→ Fan aktif (sıcaklık yüksek)"));
+  }
+  else {
+    if (dht_nem < HEDEF_NEM - 5.0) {
+      digitalWrite(ROLE_ISITICI, HIGH);
+      Serial.println(F("→ Nem düşük, ısıtıcı açık"));
+    }
+    else if (dht_nem > HEDEF_NEM + 5.0) {
+      digitalWrite(ROLE_FAN, HIGH);
+      Serial.println(F("→ Nem yüksek, fan açık"));
+    }
+    else {
+      roleleriKapat();
+      Serial.println(F("→ Ortam ideal, röleler kapalı"));
+    }
+  }
+}
+
+// ==== Röleleri Kapat ====
+void roleleriKapat() {
+  digitalWrite(ROLE_ISITICI, LOW);
+  digitalWrite(ROLE_FAN, LOW);
+}
+
+// ==== Sensör Hatası Alarmı (bip bip düşük ton -> bunu yangın alarmıyla karıştırma diye düşük ton ayarlıyom) ====
+void sensorHataAlarmi() {
+  static unsigned long oncekiBipZamani = 0;
+  unsigned long simdi = millis();
+
+  if (simdi - oncekiBipZamani >= 1000) { // 1000 = 1 sn
+    oncekiBipZamani = simdi;
+    tone(BUZZER, 600, 200); // 600 yazan yer 600 Herz oluyo, 200 yazan yer 200 ms
+  }
+}
+
+// ==== Yangın Alarmı (sürekli yüksek ton) ====
+void yanginAlarmi() {
+  tone(BUZZER, HIGH);
+}
